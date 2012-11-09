@@ -239,7 +239,7 @@ Tinytest.addAsync("mongo-livedata - fuzz test", function(test, onComplete) {
 
     finishObserve(function () {
       if (Meteor.isServer)
-        obs._suspendPolling();
+        obs._liveResultsSet._suspendPolling();
 
       // Do a batch of 1-10 operations
       var batch_count = rnd(10) + 1;
@@ -272,7 +272,7 @@ Tinytest.addAsync("mongo-livedata - fuzz test", function(test, onComplete) {
         }
       }
       if (Meteor.isServer)
-        obs._resumePolling();
+        obs._liveResultsSet._resumePolling();
 
     });
 

@@ -20,6 +20,8 @@ _Mongo = function (url) {
 
   self.collection_queue = [];
 
+  self._liveResultSets = {};
+
   MongoDB.connect(url, function(err, db) {
     if (err)
       throw err;
@@ -258,6 +260,7 @@ _Mongo.prototype._ensureIndex = function (collectionName, index, options) {
 // It wraps a SynchronousCursor (lazily: it doesn't contact Mongo
 // until you call a method like fetch or forEach on it).
 //
+// XXX REDOC
 // _Mongo.LiveResultsSet is the "observe handle" returned from observe
 // (and _observeUnordered). It also wraps a SynchronousCursor.
 
@@ -398,6 +401,7 @@ _Mongo.SynchronousCursor.prototype.getRawObjects = function (ordered) {
   }
 };
 
+// XXX REDOC
 // options to contain:
 //  * callbacks for observe():
 //    - added (object, before_index)
@@ -412,36 +416,65 @@ _Mongo.SynchronousCursor.prototype.getRawObjects = function (ordered) {
 // attributes available on returned LiveResultsSet
 //  * stop(): end updates
 
-_Mongo.prototype._getLiveResultsSet = function (cursorDescription, ordered,
-                                                callbacks) {
+var nextObserveHandleId = 1;
+var ObserveHandle = function (liveResultsSet, callbacks) {
   var self = this;
-  return new _Mongo.LiveResultsSet(
-    cursorDescription,
-    self._createSynchronousCursor(cursorDescription),
-    ordered,
-    callbacks);
+  self._liveResultsSet = liveResultsSet;
+  self._added = callbacks.added;
+  self._changed = callbacks.changed;
+  self._removed = callbacks.removed;
+  self._moved = callbacks.moved;
+  self._observeHandleId = nextObserveHandleId++;
+
+  self._liveResultsSet._addObserveHandle(self);
+};
+ObserveHandle.prototype.stop = function () {
+  var self = this;
+  self._liveResultsSet._removeObserveHandle(self);
+  self._liveResultsSet = null;
+};
+
+_Mongo.prototype._observe = function (cursorDescription, ordered, callbacks) {
+  var self = this;
+  var observeKey = JSON.stringify(
+    _.extend({ordered: ordered}, cursorDescription));
+
+  var liveResultsSet;
+  if (_.has(self._liveResultSets, observeKey)) {
+    liveResultsSet = self._liveResultSets[observeKey];
+  } else {
+    liveResultsSet = self._liveResultSets[observeKey] =
+      new _Mongo.LiveResultsSet(
+        cursorDescription,
+        self._createSynchronousCursor(cursorDescription),
+        ordered,
+        function () {
+          delete self._liveResultSets[observeKey];
+        });
+  }
+  return new ObserveHandle(liveResultsSet, callbacks);
 };
 
 _Mongo.Cursor.prototype.observe = function (callbacks) {
   var self = this;
-  return self._mongo._getLiveResultsSet(
+  return self._mongo._observe(
     self._cursorDescription, true, callbacks);
 };
 
 _Mongo.Cursor.prototype._observeUnordered = function (callbacks) {
   var self = this;
-  return self._mongo._getLiveResultsSet(
+  return self._mongo._observe(
     self._cursorDescription, false, callbacks);
 };
 
-_Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor, ordered,
-                                  callbacks) {
+_Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor,
+                                  ordered, removeFromRegistryCallback) {
   var self = this;
 
   self._cursorDescription = cursorDescription;
   self._synchronousCursor = synchronousCursor;
-
   self._ordered = ordered;
+  self._removeFromRegistryCallback = removeFromRegistryCallback;
 
   // previous results snapshot.  on each poll cycle, diffs against
   // results drives the callbacks.
@@ -479,8 +512,22 @@ _Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor, ordered,
     });
   });
 
-  // user callbacks
-  self._callbacks = callbacks;
+  self._observeHandles = {};
+
+  self._callbackMultiplexer = {};
+  var callbackNames = ['added', 'changed', 'removed'];
+  if (self._ordered)
+    callbackNames.push('moved');
+  _.each(callbackNames, function (callback) {
+    var handleCallback = '_' + callback;
+    self._callbackMultiplexer[callback] = function () {
+      var args = _.toArray(arguments);
+      _.each(self._observeHandles, function (handle) {
+        if (handle[handleCallback])
+          handle[handleCallback].apply(null, args);
+      });
+    };
+  });
 
   // run the first _poll() cycle synchronously.
   self._pollRunning = true;
@@ -518,7 +565,7 @@ _Mongo.LiveResultsSet.prototype._unthrottledMarkDirty = function () {
   }).run();
 };
 
-// interface for tests to control when polling happens
+// interface for tests to control when polling happens.
 _Mongo.LiveResultsSet.prototype._suspendPolling = function() {
   this._pollingSuspended = true;
 };
@@ -533,18 +580,41 @@ _Mongo.LiveResultsSet.prototype._doPoll = function () {
 
   // Get the new query results
   self._synchronousCursor.rewind();
-  var new_results = self._synchronousCursor.getRawObjects(self._ordered);
-  var old_results = self._results;
+  var newResults = self._synchronousCursor.getRawObjects(self._ordered);
+  var oldResults = self._results;
 
-  LocalCollection._diffQuery(
-    self._ordered, old_results, new_results, self._callbacks, true);
-  self._results = new_results;
+  if (!_.isEmpty(self._observeHandles))
+    LocalCollection._diffQuery(
+      self._ordered, oldResults, newResults, self._callbackMultiplexer, true);
+  self._results = newResults;
 };
 
-_Mongo.LiveResultsSet.prototype.stop = function () {
+// XXXXXXXXX deal with async-ness of the world
+_Mongo.LiveResultsSet.prototype._addObserveHandle = function (handle) {
   var self = this;
-  _.each(self._crossbarListeners, function (l) { l.stop(); });
-  Meteor.clearInterval(self._refreshTimer);
+  if (_.has(self._observeHandles, handle._observeHandleId))
+    throw new Error("Duplicate observe handle ID");
+  self._observeHandles[handle._observeHandleId] = handle;
+
+  // Send initial adds.
+  _.each(self._results, function (doc, i) {
+    handle._added(LocalCollection._deepcopy(doc),
+                  self._ordered ? i : undefined);
+  });
+};
+
+_Mongo.LiveResultsSet.prototype._removeObserveHandle = function (handle) {
+  var self = this;
+  if (!_.has(self._observeHandles, handle._observeHandleId))
+    throw new Error("Unknown observe handle ID " + handle._observeHandleId);
+  delete self._observeHandles[handle._observeHandleId];
+
+  // Was that the last observer of this query? Shut it all down.
+  if (_.isEmpty(self._observeHandles)) {
+    self._removeFromRegistryCallback();
+    _.each(self._crossbarListeners, function (l) { l.stop(); });
+    Meteor.clearInterval(self._refreshTimer);
+  }
 };
 
 _.extend(Meteor, {
