@@ -20,7 +20,7 @@ _Mongo = function (url) {
 
   self.collection_queue = [];
 
-  self._liveResultSets = {};
+  self._liveResultsSets = {};
 
   MongoDB.connect(url, function(err, db) {
     if (err)
@@ -426,11 +426,13 @@ var ObserveHandle = function (liveResultsSet, callbacks) {
   self._moved = callbacks.moved;
   self._observeHandleId = nextObserveHandleId++;
 
+  // XXX what if it's polling during this call?
   self._liveResultsSet._addObserveHandle(self);
 };
 ObserveHandle.prototype.stop = function () {
   var self = this;
-  self._liveResultsSet._removeObserveHandle(self);
+  // XXX what if it's polling during this call?
+  self._liveResultsSet._removeObserveHandleAndDecrementRefcount(self);
   self._liveResultsSet = null;
 };
 
@@ -440,19 +442,24 @@ _Mongo.prototype._observe = function (cursorDescription, ordered, callbacks) {
     _.extend({ordered: ordered}, cursorDescription));
 
   var liveResultsSet;
-  if (_.has(self._liveResultSets, observeKey)) {
-    liveResultsSet = self._liveResultSets[observeKey];
+  if (_.has(self._liveResultsSets, observeKey)) {
+    self._liveResultsSets[observeKey]._incrementRefcount();
   } else {
-    liveResultsSet = self._liveResultSets[observeKey] =
-      new _Mongo.LiveResultsSet(
-        cursorDescription,
-        self._createSynchronousCursor(cursorDescription),
-        ordered,
-        function () {
-          delete self._liveResultSets[observeKey];
-        });
+    // Make a new LiveResultsSet. The constructor guarantees that it stores
+    // itself in _liveResultsSets before it could yield.
+    new _Mongo.LiveResultsSet(
+      cursorDescription,
+      self._createSynchronousCursor(cursorDescription),
+      ordered,
+      self._liveResultsSets,
+      observeKey);
   }
-  return new ObserveHandle(liveResultsSet, callbacks);
+
+  // XXX what if the following happens:
+  //     - register itself
+  //     - during a yield, another one adds and finishes
+  //     - then it stops it !!!
+  return new ObserveHandle(self._liveResultsSets[observeKey], callbacks);
 };
 
 _Mongo.Cursor.prototype.observe = function (callbacks) {
@@ -468,13 +475,14 @@ _Mongo.Cursor.prototype._observeUnordered = function (callbacks) {
 };
 
 _Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor,
-                                  ordered, removeFromRegistryCallback) {
+                                  ordered, registry, registryKey) {
   var self = this;
 
   self._cursorDescription = cursorDescription;
   self._synchronousCursor = synchronousCursor;
   self._ordered = ordered;
-  self._removeFromRegistryCallback = removeFromRegistryCallback;
+  self._registry = registry;
+  self._registryKey = registryKey;
 
   // previous results snapshot.  on each poll cycle, diffs against
   // results drives the callbacks.
@@ -514,6 +522,17 @@ _Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor,
 
   self._observeHandles = {};
 
+  // The refcount is incremented right before an ObserveHandle other than the
+  // first one is inserted, and is decremented after an ObserveHandle is
+  // removed. The underlying cursor stops when it becomes zero. Why not skip the
+  // refcount and stop when self._observeHandles becomes empty? We need to be
+  // able to do the initial poll cycle at the end of this constructor, which can
+  // yield. During this period, the initial ObserveHandle has not yet been
+  // constructed, so _observeHandles is empty. We don't want to stop the cursor
+  // if (eg) in the meantime another handle gets added and removed, before the
+  // initial one even gets added!
+  self._refCount = 1;
+
   self._callbackMultiplexer = {};
   var callbackNames = ['added', 'changed', 'removed'];
   if (self._ordered)
@@ -529,16 +548,20 @@ _Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor,
     };
   });
 
-  // run the first _poll() cycle synchronously.
-  self._pollRunning = true;
-  self._doPoll();
-  self._pollRunning = false;
-
   // every once and a while, poll even if we don't think we're dirty,
   // for eventual consistency with database writes from outside the
   // Meteor universe
   self._refreshTimer = Meteor.setInterval(_.bind(self._markDirty, this),
                                           10 * 1000 /* 10 seconds */);
+
+  // EVERYTHING UP TO THIS POINT HAS BEEN SYNCHRONOUS WITHOUT YIELDING. Register
+  // self in the registry.
+  self._registry[self._registryKey] = self;
+
+  // Run the first _poll() cycle synchronously. This may yield.
+  self._pollRunning = true;
+  self._doPoll();
+  self._pollRunning = false;
 };
 
 _Mongo.LiveResultsSet.prototype._unthrottledMarkDirty = function () {
@@ -603,19 +626,25 @@ _Mongo.LiveResultsSet.prototype._addObserveHandle = function (handle) {
   });
 };
 
-_Mongo.LiveResultsSet.prototype._removeObserveHandle = function (handle) {
+_Mongo.LiveResultsSet.prototype._incrementRefcount = function () {
   var self = this;
-  if (!_.has(self._observeHandles, handle._observeHandleId))
-    throw new Error("Unknown observe handle ID " + handle._observeHandleId);
-  delete self._observeHandles[handle._observeHandleId];
-
-  // Was that the last observer of this query? Shut it all down.
-  if (_.isEmpty(self._observeHandles)) {
-    self._removeFromRegistryCallback();
-    _.each(self._crossbarListeners, function (l) { l.stop(); });
-    Meteor.clearInterval(self._refreshTimer);
-  }
+  ++self._refCount;
 };
+
+_Mongo.LiveResultsSet.prototype._removeObserveHandleAndDecrementRefcount =
+    function (handle) {
+      var self = this;
+      if (!_.has(self._observeHandles, handle._observeHandleId))
+        throw new Error("Unknown observe handle ID " + handle._observeHandleId);
+      delete self._observeHandles[handle._observeHandleId];
+
+      --self._refCount;
+      if (self._refCount === 0) {
+        delete self._registry[self._registryKey];
+        _.each(self._crossbarListeners, function (l) { l.stop(); });
+        Meteor.clearInterval(self._refreshTimer);
+      }
+    };
 
 _.extend(Meteor, {
   _Mongo: _Mongo
